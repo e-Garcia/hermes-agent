@@ -11,8 +11,6 @@ import sys
 import threading
 from pathlib import Path
 
-from dotenv.main import DotEnv
-from dotenv.variables import parse_variables
 from utils import atomic_replace, fast_safe_load
 
 logger = logging.getLogger(__name__)
@@ -265,6 +263,11 @@ def _load_dotenv_with_fallback(path: Path, *, override: bool, load_pass: int | N
         if raw.startswith(codecs.BOM_UTF8):  # strip the BOM by hand: utf-8-sig can't once we decode latin-1
             raw = raw[len(codecs.BOM_UTF8) :]
         text = raw.decode("latin-1")
+    # Imported here, not at module level: gateway tests stub ``sys.modules["dotenv"]`` with a bare module
+    # exposing only ``load_dotenv``, and ``gateway.run`` imports this module at import time.
+    from dotenv.main import DotEnv
+    from dotenv.variables import parse_variables
+
     assignments = list(DotEnv(dotenv_path=None, stream=io.StringIO(text), interpolate=False).parse())
 
     with _DOTENV_LOCK:
