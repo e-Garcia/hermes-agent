@@ -42,6 +42,7 @@ class _DispatcherSettings:
     reconcile_orphans: bool
     default_assignee: Optional[str]
     max_in_progress_per_profile: Optional[int]
+    excluded_boards: tuple[str, ...] = ()
 
 
 def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettings:
@@ -102,6 +103,9 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         logger.info("kanban dispatcher: default_assignee=%r (unassigned ready tasks "
                     "will route to this profile)", default_assignee)
 
+    excluded = kanban_cfg.get("gateway_dispatch_exclude_boards", [])
+    if not isinstance(excluded, list) or not all(isinstance(s, str) and s.strip() for s in excluded):
+        raise ValueError("kanban.gateway_dispatch_exclude_boards must be a list of nonempty board slugs")
     return _DispatcherSettings(
         interval=interval,
         max_spawn=max_spawn,
@@ -115,6 +119,7 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         # Per-profile concurrency cap: no single profile's local model / API
         # quota / browser pool gets overwhelmed by a fan-out.
         max_in_progress_per_profile=_positive_int_setting(kanban_cfg, "max_in_progress_per_profile"),
+        excluded_boards=tuple(excluded),
     )
 
 
@@ -135,7 +140,10 @@ class _KanbanDispatcher:
         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
 
     def _board_slugs(self) -> list:
-        return _board_slugs(self.kb)
+        # A board with its own guarded cron dispatcher must not also be claimed
+        # by the embedded gateway, which does not apply that board's approvals.
+        return [slug for slug in _board_slugs(self.kb)
+                if slug not in self.settings.excluded_boards]
 
     def board_db_fingerprint(self, slug: str) -> tuple[str, int | None, int | None]:
         from hermes_cli import kanban_db as _kb
