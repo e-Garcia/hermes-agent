@@ -42,6 +42,14 @@ HERMES_HOME = get_hermes_home()
 TOKEN_PATH = HERMES_HOME / "google_token.json"
 CLIENT_SECRET_PATH = HERMES_HOME / "google_client_secret.json"
 
+# Gmail send restriction: set HERMES_GMAIL_NO_SEND=1 to block gmail_send()/gmail_reply().
+# Software guard only: it does not revoke the token scopes. See gws_bridge.py.
+NO_SEND = os.environ.get("HERMES_GMAIL_NO_SEND", "").strip().lower() in ("1", "true", "yes", "on")
+SEND_BLOCKED_MESSAGE = (
+    "Sending is blocked by user policy: outgoing emails must be saved as drafts so the owner can review "
+    "and send them. Create a draft instead (gws gmail +send/+reply --draft). Do not retry the send."
+)
+
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.send",
@@ -378,6 +386,9 @@ def gmail_get(args):
 
 
 def gmail_send(args):
+    if NO_SEND:
+        print(json.dumps({"status": "blocked", "error": SEND_BLOCKED_MESSAGE}, indent=2))
+        return
     if _gws_binary():
         message = MIMEText(args.body, "html" if args.html else "plain")
         message["To"] = args.to
@@ -421,6 +432,9 @@ def gmail_send(args):
 
 
 def gmail_reply(args):
+    if NO_SEND:
+        print(json.dumps({"status": "blocked", "error": SEND_BLOCKED_MESSAGE}, indent=2))
+        return
     if _gws_binary():
         original = _run_gws(
             ["gmail", "users", "messages", "get"],
