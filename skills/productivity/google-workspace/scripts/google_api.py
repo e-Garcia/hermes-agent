@@ -27,7 +27,7 @@ import os
 import shutil
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from email.mime.text import MIMEText
 from pathlib import Path
 
@@ -41,6 +41,14 @@ from _hermes_home import get_hermes_home
 HERMES_HOME = get_hermes_home()
 TOKEN_PATH = HERMES_HOME / "google_token.json"
 CLIENT_SECRET_PATH = HERMES_HOME / "google_client_secret.json"
+
+# Gmail send restriction: set HERMES_GMAIL_NO_SEND=1 to block gmail_send()/gmail_reply().
+# Software guard only: it does not revoke the token scopes. See gws_bridge.py.
+NO_SEND = os.environ.get("HERMES_GMAIL_NO_SEND", "").strip().lower() in ("1", "true", "yes", "on")
+SEND_BLOCKED_MESSAGE = (
+    "Sending is blocked by user policy: outgoing emails must be saved as drafts so the owner can review "
+    "and send them. Create a draft instead (gws gmail +send/+reply --draft). Do not retry the send."
+)
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -110,6 +118,7 @@ def _run_gws(parts: list[str], *, params: dict | None = None, body: dict | None 
         capture_output=True,
         text=True, encoding='utf-8', errors='replace',
         env=_gws_env(),
+        check=False,
     )
     if result.returncode != 0:
         err = result.stderr.strip() or result.stdout.strip() or "Unknown gws error"
@@ -275,7 +284,7 @@ def build_service(api, version):
 # =========================================================================
 
 
-def gmail_search(args):
+def gmail_search(args: argparse.Namespace) -> None:
     if _gws_binary():
         results = _run_gws(
             ["gmail", "users", "messages", "list"],
@@ -314,9 +323,6 @@ def gmail_search(args):
         userId="me", q=args.query, maxResults=args.max
     ).execute()
     messages = results.get("messages", [])
-    if not messages:
-        print("No messages found.")
-        return
 
     output = []
     for msg_meta in messages:
@@ -380,6 +386,9 @@ def gmail_get(args):
 
 
 def gmail_send(args):
+    if NO_SEND:
+        print(json.dumps({"status": "blocked", "error": SEND_BLOCKED_MESSAGE}, indent=2))
+        return
     if _gws_binary():
         message = MIMEText(args.body, "html" if args.html else "plain")
         message["To"] = args.to
@@ -423,6 +432,9 @@ def gmail_send(args):
 
 
 def gmail_reply(args):
+    if NO_SEND:
+        print(json.dumps({"status": "blocked", "error": SEND_BLOCKED_MESSAGE}, indent=2))
+        return
     if _gws_binary():
         original = _run_gws(
             ["gmail", "users", "messages", "get"],
@@ -526,7 +538,7 @@ def gmail_modify(args):
 
 
 def calendar_list(args):
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     time_min = _datetime_with_timezone(args.start or now.isoformat())
     time_max = _datetime_with_timezone(args.end or (now + timedelta(days=7)).isoformat())
 

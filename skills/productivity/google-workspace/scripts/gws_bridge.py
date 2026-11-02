@@ -7,7 +7,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 
 # Ensure sibling modules (_hermes_home) are importable when run standalone.
@@ -71,8 +71,8 @@ def refresh_token(token_data: dict) -> dict:
 
     token_data["token"] = result["access_token"]
     token_data["expiry"] = datetime.fromtimestamp(
-        datetime.now(timezone.utc).timestamp() + result["expires_in"],
-        tz=timezone.utc,
+        datetime.now(UTC).timestamp() + result["expires_in"],
+        tz=UTC,
     ).isoformat()
 
     get_token_path().write_text(
@@ -92,12 +92,51 @@ def get_valid_token() -> str:
 
     expiry = token_data.get("expiry", "")
     if expiry:
-        exp_dt = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
-        now = datetime.now(timezone.utc)
+        exp_dt = datetime.fromisoformat(expiry)
+        now = datetime.now(UTC)
         if now >= exp_dt:
             token_data = refresh_token(token_data)
 
     return token_data["token"]
+
+
+# =========================================================================
+# Gmail send restriction (blocks all outgoing email regardless of scopes)
+# Set HERMES_GMAIL_NO_SEND=1 to activate. Drafts stay allowed. This is a
+# software guard: Google gives drafts and sends the same OAuth scope, and a
+# direct call to the gws binary (not through this bridge) is not covered.
+# =========================================================================
+
+GMAIL_SEND_BLOCKED_MESSAGE = (
+    "Sending is blocked by user policy: outgoing emails must be saved as drafts so the owner can review "
+    "and send them. Use the draft path instead: add --draft to gws gmail +send/+reply/+reply-all/+forward, "
+    "or create a draft with gws gmail users drafts create. Do not retry the send."
+)
+
+# Helpers that send unless --draft is given.
+_SENDING_HELPERS = ("+send", "+reply", "+reply-all", "+forward")
+
+
+def no_send_enabled() -> bool:
+    return os.environ.get("HERMES_GMAIL_NO_SEND", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _is_gmail_send_call(argv):
+    """True if this gws argv would send mail.
+
+    Blocked: gmail users messages send, gmail users drafts send, and the helpers
+    +send/+reply/+reply-all/+forward unless --draft or --dry-run is present.
+    """
+    tokens = [a for a in argv if not a.startswith("-")]
+    flags = {a.split("=", 1)[0] for a in argv if a.startswith("-")}
+    if "gmail" not in tokens:
+        return False
+    for i in range(len(tokens) - 1):
+        if tokens[i] in ("messages", "drafts") and tokens[i + 1] == "send":
+            return True
+    if any(t in _SENDING_HELPERS for t in tokens) and not ({"--draft", "--dry-run"} & flags):
+        return True
+    return False
 
 
 def main():
@@ -106,11 +145,16 @@ def main():
         print("Usage: gws_bridge.py <gws args...>", file=sys.stderr)
         sys.exit(1)
 
+    # Block Gmail send operations when HERMES_GMAIL_NO_SEND is set
+    if no_send_enabled() and _is_gmail_send_call(sys.argv[1:]):
+        print(json.dumps({"status": "blocked", "error": GMAIL_SEND_BLOCKED_MESSAGE}, indent=2))
+        sys.exit(1)
+
     access_token = get_valid_token()
     env = os.environ.copy()
     env["GOOGLE_WORKSPACE_CLI_TOKEN"] = access_token
 
-    result = subprocess.run(["gws"] + sys.argv[1:], env=env)
+    result = subprocess.run(["gws"] + sys.argv[1:], env=env, check=False)
     sys.exit(result.returncode)
 
 

@@ -42,6 +42,7 @@ class _DispatcherSettings:
     reconcile_orphans: bool
     default_assignee: Optional[str]
     max_in_progress_per_profile: Optional[int]
+    excluded_boards: tuple[str, ...] = ()
 
 
 def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettings:
@@ -102,6 +103,9 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         logger.info("kanban dispatcher: default_assignee=%r (unassigned ready tasks "
                     "will route to this profile)", default_assignee)
 
+    excluded = kanban_cfg.get("gateway_dispatch_exclude_boards", [])
+    if not isinstance(excluded, list) or not all(isinstance(s, str) and s.strip() for s in excluded):
+        raise ValueError("kanban.gateway_dispatch_exclude_boards must be a list of nonempty board slugs")
     return _DispatcherSettings(
         interval=interval,
         max_spawn=max_spawn,
@@ -115,6 +119,7 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         # Per-profile concurrency cap: no single profile's local model / API
         # quota / browser pool gets overwhelmed by a fan-out.
         max_in_progress_per_profile=_positive_int_setting(kanban_cfg, "max_in_progress_per_profile"),
+        excluded_boards=tuple(excluded),
     )
 
 
@@ -135,10 +140,15 @@ class _KanbanDispatcher:
         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
 
     def _board_slugs(self) -> list:
-        return _board_slugs(self.kb)
+        # A board with its own guarded cron dispatcher must not also be claimed
+        # by the embedded gateway, which does not apply that board's approvals.
+        return [slug for slug in _board_slugs(self.kb)
+                if slug not in self.settings.excluded_boards]
 
     def board_db_fingerprint(self, slug: str) -> tuple[str, int | None, int | None]:
-        path = self.kb.kanban_db_path(slug)
+        from hermes_cli import kanban_db as _kb
+        with _kb.pin_first_board_resolution():
+            path = self.kb.kanban_db_path(slug)
         try:
             resolved = str(path.expanduser().resolve())
         except Exception:
@@ -181,12 +191,18 @@ class _KanbanDispatcher:
         fingerprint = self.board_db_fingerprint(slug)
         if not self._quarantine_lifted(slug, fingerprint):
             return None
-        kwargs = {k: v for k, v in asdict(self.settings).items() if k != "interval"}
+        kwargs = {k: v for k, v in asdict(self.settings).items()
+                  if k not in ("interval", "excluded_boards")}
         try:
             # No explicit init_db(): connect() runs the migration once per
             # process (see the matching note in the notifier collector).
-            conn = _kbc().connect(board=slug)
-            return _kbd().dispatch_once(conn, board=slug, **kwargs)
+            # Pin-first: the tick is machine flow — on a box whose env pins
+            # HERMES_KANBAN_DB every enumerated slug must resolve to the pinned
+            # file, or the dispatcher reads per-slug DBs nobody writes.
+            from hermes_cli import kanban_db as _kb
+            with _kb.pin_first_board_resolution():
+                conn = _kbc().connect(board=slug)
+                return _kbd().dispatch_once(conn, board=slug, **kwargs)
         except Exception as exc:
             if self.is_corrupt_board_db_error(exc):
                 self.disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
@@ -221,18 +237,20 @@ class _KanbanDispatcher:
         """
         kbd = _kbd()
         _review_probe = kbd.review_dispatch_enabled()
-        for slug in self._board_slugs():
-            conn = None
-            try:
-                conn = _kbc().connect(board=slug)
-                if kbd.has_spawnable_ready(conn) or (_review_probe and kbd.has_spawnable_review(conn)):
-                    return True
-            except Exception:
-                continue
-            finally:
-                if conn is not None:
-                    with contextlib.suppress(Exception):
-                        conn.close()
+        from hermes_cli import kanban_db as _kb
+        with _kb.pin_first_board_resolution():
+            for slug in self._board_slugs():
+                conn = None
+                try:
+                    conn = _kbc().connect(board=slug)
+                    if kbd.has_spawnable_ready(conn) or (_review_probe and kbd.has_spawnable_review(conn)):
+                        return True
+                except Exception:
+                    continue
+                finally:
+                    if conn is not None:
+                        with contextlib.suppress(Exception):
+                            conn.close()
         return False
 
     def auto_decompose_tick(self, auto_decompose_per_tick: int) -> int:
@@ -248,7 +266,8 @@ class _KanbanDispatcher:
             return 0
         attempted = 0
         successes = 0
-        with _default_profile_secret_scope():
+        from hermes_cli import kanban_db as _kb
+        with _default_profile_secret_scope(), _kb.pin_first_board_resolution():
             for slug in self._board_slugs():
                 if attempted >= auto_decompose_per_tick:
                     break
@@ -302,14 +321,14 @@ def _default_profile_secret_scope():
     LLM reads ``auxiliary.*`` from ``get_hermes_home()``, so its credentials come
     from that same home. No-op for single-profile gateways.
     """
-    from agent.secret_scope import (
-        build_profile_secret_scope, is_multiplex_active, reset_secret_scope, set_secret_scope)
+    from agent.secret_scope import is_multiplex_active, reset_secret_scope, set_secret_scope
     from hermes_constants import get_hermes_home
+    from tui_gateway.launch_profile_policy import owner_secret_scope
 
     if not is_multiplex_active():
         yield
         return
-    token = set_secret_scope(build_profile_secret_scope(Path(get_hermes_home())))
+    token = set_secret_scope(owner_secret_scope(Path(get_hermes_home())), profile_home=str(get_hermes_home()))
     try:
         yield
     finally:
